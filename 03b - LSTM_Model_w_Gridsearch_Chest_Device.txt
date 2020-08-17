@@ -1,0 +1,529 @@
+
+!pip install torch-lr-finder
+!pip install -U skorch
+
+import os
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+import skorch
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset
+from torch.utils.data.dataloader import DataLoader
+from tqdm.notebook import tqdm
+
+%matplotlib inline
+
+# !wget https://github.com/santteegt/om-fol-timeseries/archive/master.zip -O om-fol-timeseries.zip && unzip om-fol-timeseries.zip && rm om-fol-timeseries.zip
+# !wget https://github.com/santteegt/om-fol-timeseries/raw/master/segmented_data/WESAD_segmented.zip && unzip -d data WESAD_segmented.zip && rm WESAD_segmented.zip
+# from google.colab import files
+# uploaded = files.upload()
+
+!gdown --id 1_56HAZc2XSXQCAR4iZODq9VAoyq5CvAs  # segmented dataset on my Google drive
+
+!ls -l
+
+# BASE_PATH = './data'
+# [subject for subject in os.listdir(BASE_PATH) if subject.endswith('.feather')]
+
+df = pd.read_csv('all_subjects.csv', index_col=0)
+df.shape
+
+df.label = df.label - 1
+
+class WESADDataset(Dataset):
+    #Constructor is mandatory
+    def __init__(self, dataframe, transform=None):
+        # normalizer = StandardScaler()
+        # Since different subjects have different responses on the signal values, min-max normalisation was conducted across different signals to normalize them to the same scale
+        normalizer = MinMaxScaler()
+        self.dataframe = dataframe.drop(columns=['subject','label'])
+        # self.X = self.dataframe.astype(np.float32).to_numpy()
+        # Normalize features
+        self.X = normalizer.fit_transform(self.dataframe.astype(np.float32))
+        self.labels = dataframe['label']
+        self.transform = transform # e.g. torch.Tensor
+    
+    def to_torchtensor(self):            
+        self.dataframe = torch.from_numpy(self.dataframe)
+        self.labels = torch.from_numpy(self.labels)
+    
+    def __len__(self):
+        #Mandatory
+        '''Returns:
+                Length [int]: Length of Dataset/batches
+        '''
+        return self.dataframe.shape[0]
+
+    def __getitem__(self, idx): 
+        #Mandatory 
+        
+        '''Returns:
+                    Data [Torch Tensor]: 
+                    Target [ Torch Tensor]:
+        '''
+        sample = self.X[idx]
+        # sample = self.X[idx].reshape(1, -1)
+        target = self.labels[idx]
+                
+        if self.transform:
+            sample = self.transform(sample)
+
+        return sample, target
+
+def get_data_loader(subject, train_batch_size=128, val_batch_size=5):
+
+    train = WESADDataset(df[df['subject'] != subject].reset_index(drop=True))
+    test = WESADDataset(df[df['subject'] == subject].reset_index(drop=True))
+
+    train_dl = torch.utils.data.DataLoader(train, batch_size=train_batch_size, shuffle=True, pin_memory=True, num_workers=4)
+    val_dl = torch.utils.data.DataLoader(test, batch_size=val_batch_size, shuffle=False, pin_memory=True, num_workers=4)
+    
+    return train_dl, val_dl
+
+def get_default_device():
+    """Pick GPU if available, else CPU"""
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    else:
+        return torch.device('cpu')
+
+def to_device(data, device):
+    """Move tensor(s) to chosen device"""
+    if isinstance(data, (list,tuple)):
+        return [to_device(x, device) for x in data]
+    return data.to(device, non_blocking=True)
+
+
+class DeviceDataLoader():
+    """Wrap a dataloader to move data to a device"""
+    def __init__(self, dl, device):
+        self.dl = dl
+        self.device = device
+        
+    def __iter__(self):
+        """Yield a batch of data after moving it to device"""
+        for b in self.dl: 
+            yield to_device(b, self.device)
+
+    def __len__(self):
+        """Number of batches"""
+        return len(self.dl)
+
+from sklearn.metrics import f1_score
+
+def accuracy(outputs, labels):
+    _, preds = torch.max(outputs, dim=1)
+    return torch.tensor(torch.sum(preds == labels).item() / len(preds))
+
+def f1(output, label, threshold=0.5, beta=1):
+    probs = torch.argmax(output.data.to('cpu'), dim=1)
+    preds = label.data.to('cpu')
+    return f1_score(preds, probs, average='macro')
+
+def plot_scores(history):
+    t_acc = [x['train_acc'] for x in history]
+    plt.plot(t_acc, '-x', label='Train Acc')
+
+    accuracies = [x['val_acc'] for x in history]
+    f1 = [x['val_f1'] for x in history]
+    plt.plot(accuracies, '-x', label='Valid Acc')
+    plt.plot(f1, '-x', label='Val F1')
+    plt.xlabel('epoch')
+    plt.ylabel('Score')
+    plt.title('Score vs. No. of epochs')
+    plt.legend();
+
+def plot_losses(history):
+    train_losses = [x.get('train_loss') for x in history]
+    val_losses = [x['val_loss'] for x in history]
+    plt.plot(train_losses, '-bx')
+    plt.plot(val_losses, '-rx')
+    plt.xlabel('epoch')
+    plt.ylabel('loss')
+    plt.legend(['Training', 'Validation'])
+    plt.title('Loss vs. No. of epochs');
+
+class BaseModel(nn.Module):
+    def training_step(self, batch):
+        data, labels = batch 
+        out = self(data)                  # Generate predictions
+        loss = F.cross_entropy(out, labels) # Calculate loss
+        return loss
+    
+    def validation_step(self, batch):
+        data, labels = batch 
+        out = self(data)                    # Generate predictions
+        # print('out', out.shape)
+        loss = F.cross_entropy(out, labels)   # Calculate loss
+        # print('loss', loss.shape)
+        out = F.softmax(out, dim=1)           # Apply Softmax
+        acc = accuracy(out, labels)           # Calculate accuracy
+        f1_ = f1(out, labels)                  # Calculate F1
+        return {'val_loss': loss.detach(), 'val_acc': acc, 'val_f1': f1_}
+        
+    def validation_epoch_end(self, outputs):
+        batch_losses = [x['val_loss'] for x in outputs]
+        epoch_loss = torch.stack(batch_losses).mean()   # Combine losses
+        batch_accs = [x['val_acc'] for x in outputs]
+        batch_f1 = [x['val_f1'] for x in outputs]
+        # print('batch_f1', len(batch_f1))
+        epoch_acc = torch.stack(batch_accs).mean()      # Combine accuracies
+        epoch_f1 = np.mean(np.array(batch_f1))         # Combine F1 scores
+        return {'val_loss': epoch_loss.item(), 'val_acc': epoch_acc.item(), 'val_f1': epoch_f1.item()}
+    
+    def epoch_end(self, epoch, result):
+        print("Epoch [{}], train_loss: {:.4f}, train_acc: {:.4f}, val_loss: {:.4f}, val_acc: {:.4f}, val_f1: {:.4f}".format(
+            epoch, result['train_loss'], result['train_acc'], result['val_loss'], result['val_acc'], result['val_f1']))
+
+@torch.no_grad()
+def evaluate(model, val_loader):
+    model.eval()
+    outputs = [model.validation_step(batch) for batch in val_loader]
+    return model.validation_epoch_end(outputs)
+
+def fit(epochs, lr, model, train_loader, val_loader, optimizer):
+    history = []
+    for epoch in range(epochs):
+        # Training Phase 
+        model.train()
+        train_accs = []
+        train_losses = []
+        for batch in tqdm(train_loader):
+            loss = model.training_step(batch)
+            train_losses.append(loss)
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
+            data, labels = batch
+            train_out = F.softmax(model(data), dim=1)
+            train_accs.append(accuracy(train_out, labels))
+
+
+        # Validation phase
+        result = evaluate(model, val_loader)
+        result['train_loss'] = torch.stack(train_losses).mean().item()
+        result['train_acc'] = torch.stack(train_accs).mean().item()
+        history.append(result)
+
+        # if epoch < 5 or (epoch + 1) % 5 == 0:
+        model.epoch_end(epoch, result)
+            
+    return history
+
+class WesadFeedForward(BaseModel):
+    def __init__(self, input_dim, output_dim=3):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.Dropout(0.5),
+            nn.ReLU(),
+            nn.Linear(128, 256),
+            nn.Dropout(0.5),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.Linear(128, output_dim),
+            #nn.Dropout(0.5),
+            # nn.Softmax(dim=1)
+        )
+        
+    def forward(self, x):
+        return self.network(x)
+
+
+class WesadLSTM(BaseModel):
+    def __init__(self, input_dim, hidden_dim, output_dim=3, lstm_layers=1, dropout=0.2):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.classes = output_dim
+        # self.linear1 = nn.Linear(input_dim, input_dim)
+        # self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=lstm_layers, batch_first=True, dropout=0.2)
+        self.lstm = nn.LSTM(input_size=input_dim, hidden_size=input_dim, num_layers=lstm_layers, dropout=dropout)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        xb = x.view(-1, 1, self.input_dim)
+        # print('x', xb.shape)
+        # out = self.linear1(x)
+        # out = x.view(x.shape, -1)
+        # print(out.shape)
+        # out = self.dropout(out)
+        # lstm_out, (ht, ct) = self.lstm(out)
+        # out = self.fc(ht[-1])
+        lstm_out, _ = self.lstm(xb)
+        # print(lstm_out.view(-1, self.hidden_dim).shape)
+        out = self.fc(lstm_out.view(-1, self.hidden_dim))
+        # out = self.dropout(out)
+        # out = self.softmax(out)
+        # out = F.softmax(out, dim=1)
+        return out.view(-1, self.classes)
+
+
+subjects = df['subject'].unique()
+subjects.sort()
+device = get_default_device()
+
+train_batch_size = 25
+val_batch_size = 5
+input_dim = df.drop(columns=['subject', 'label']).shape[1]
+output_dim = 3
+lstm_layers = 5
+
+# lrs = [0.5, 0.1, 0.01, 0.001]
+# epochs = [20, 20, 20,  20]
+
+from torch_lr_finder import LRFinder
+
+max_lr = 1e-5
+# grad_clip = 0.001
+# weight_decay = 1e-4
+opt_func = torch.optim.Adam
+criterion = F.cross_entropy
+train_dl, val_dl = get_data_loader(subject='S2', train_batch_size=train_batch_size, val_batch_size=val_batch_size)
+
+# model = WesadFeedForward(input_dim, output_dim)
+model = WesadLSTM(input_dim=input_dim, hidden_dim=input_dim, output_dim=output_dim, lstm_layers=lstm_layers)
+# optimizer = opt_func(model.parameters(), lr=max_lr, weight_decay=weight_decay)
+optimizer = opt_func(model.parameters(), lr=max_lr)
+lr_finder = LRFinder(model, optimizer, criterion, device=device)
+lr_finder.range_test(train_dl, end_lr=10000, num_iter=1000)
+lr_finder.plot() # to inspect the loss-learning rate graph
+# lr_finder.reset() # to reset the model and optimizer to their initial state
+
+# def get_loso_cv(subjects, to_device=False):
+#     for subject in subjects:
+#         history = []
+#         print('LOSO', subject)
+#         train_dl, val_dl = get_data_loader(subject, train_batch_size=train_batch_size, val_batch_size=val_batch_size)
+#         if to_device:
+#             train_dl = DeviceDataLoader(train_dl, device)
+#             val_dl = DeviceDataLoader(val_dl, device)
+
+#         yield train_dl, val_dl
+
+# epochs = 20
+# lr = 1e-4
+
+# models = []
+# histories = []
+# val_histories = []
+# for subject in subjects:
+#     history = []
+#     print('LOSO', subject)
+#     train_dl, val_dl = get_data_loader(subject, train_batch_size=train_batch_size, val_batch_size=val_batch_size)
+#     train_ddl = DeviceDataLoader(train_dl, device)
+#     val_ddl = DeviceDataLoader(val_dl, device)
+#     # model = to_device(WesadFeedForward(input_dim, output_dim), device)
+#     model = to_device(WesadLSTM(input_dim=input_dim, hidden_dim=input_dim, 
+#                                 output_dim=output_dim, lstm_layers=lstm_layers), device)
+
+#     # optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+#     # history += fit(epochs, lr, model, train_ddl, val_ddl, optimizer)
+#     break
+
+def try_batch(model, dl):
+    model.eval()
+    for data, labels in dl:
+        # print(data)
+        # print(labels)
+        print('data.shape:', data.shape)
+        out = model(data)
+        print('out[0]', out[0])
+        print('softmax(out[0]):', F.softmax(out, dim=1)[0])
+        _, p = torch.max(F.softmax(out, dim=1), dim=1)
+        print('Max', p[0])
+        break
+
+# try_batch(model, train_ddl)
+
+# history = [evaluate(model, val_ddl)]
+# history
+
+# epochs = 5
+# lr = 5e-3
+# optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+history += fit(epochs, lr, model, train_ddl, val_ddl, optimizer)
+
+# plot_scores(history[1:])
+
+# plot_losses(history[1:])
+
+
+
+from scipy import stats
+from sklearn.model_selection import cross_validate, LeaveOneGroupOut, RandomizedSearchCV
+from skorch import NeuralNetClassifier
+from skorch.dataset import CVSplit
+
+class WesadLSTM(BaseModel):
+    def __init__(self, input_dim, hidden_dim, output_dim=3, lstm_layers=1, dropout=0.2):
+        super(WesadLSTM, self).__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.classes = output_dim
+        # self.linear1 = nn.Linear(input_dim, input_dim)
+        # self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=lstm_layers, batch_first=True, dropout=0.2)
+        self.lstm = nn.LSTM(input_size=input_dim, hidden_size=input_dim, num_layers=lstm_layers, dropout=dropout)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        xb = x.view(-1, 1, self.input_dim)
+        # print('x', xb.shape)
+        # out = self.linear1(x)
+        # out = x.view(x.shape, -1)
+        # print(out.shape)
+        # out = self.dropout(out)
+        # lstm_out, (ht, ct) = self.lstm(out)
+        # out = self.fc(ht[-1])
+        lstm_out, _ = self.lstm(xb)
+        # print(lstm_out.view(-1, self.hidden_dim).shape)
+        out = self.fc(lstm_out.view(-1, self.hidden_dim))
+        # out = self.dropout(out)
+        out = F.softmax(out.view(-1, self.classes), dim=1)
+        # out = F.softmax(out, dim=1)
+        return out
+
+NUM_CV_STEPS = 10
+input_dim = df.drop(columns=['subject', 'label']).shape[1]
+output_dim = 3
+
+optimizer = torch.optim.Adam
+
+params = {
+    # 'net__module__input_dim': [input_dim],
+    # 'net__module__hidden_dim': [input_dim],
+    # 'net__module__output_dim': [output_dim],
+    # 'net__module__lstm_layers': [1, 2, 3, 4, 5],
+    # 'net__module__dropout': stats.uniform(0, 0.9),
+    # 'net__lr': [10**(-stats.uniform(1, 5).rvs()) for _ in range(NUM_CV_STEPS)],
+    # 'net__max_epochs': [5, 10]
+    'module__input_dim': [input_dim],
+    'module__hidden_dim': [input_dim],
+    'module__output_dim': [output_dim],
+    'module__lstm_layers': [2, 3, 4, 5],
+    'module__dropout': [0., 0.2, 0.5, 0.7],
+    # 'lr': [10**(-stats.uniform(1, 5).rvs()) for _ in range(NUM_CV_STEPS)],
+    'lr': [1e-3, 5e-3, 1e-4, 5e-4, 1e-5],
+    'max_epochs': [5, 10]
+}
+
+net = NeuralNetClassifier(module=WesadLSTM,
+                    train_split=None,
+                    iterator_train__batch_size=train_batch_size,
+                    iterator_valid__batch_size=val_batch_size,
+                    # max_epochs=epochs,
+                    # lr=lr,
+                    device=device,
+                    optimizer=optimizer,
+                    callbacks=[
+                              ('accuracy', skorch.callbacks.EpochScoring(scoring='accuracy', lower_is_better=False,
+                                                                         on_train=True))  
+                    ]
+                    )
+
+search_cv = RandomizedSearchCV(net, params, n_iter=NUM_CV_STEPS, verbose=2, refit=False, scoring='accuracy', 
+                               cv=2)
+
+normalizer = MinMaxScaler()
+# data = df[df['subject'] != 'S3'].copy()
+data = df.copy()
+X = normalizer.fit_transform(data.drop(columns=['subject','label']).copy().astype(np.float32))
+y = data['label'].copy()
+%time search_cv.fit(X, y)
+
+def run_cv(clf, X, y, groups, cv, scoring=['accuracy', 'f1_macro'], return_train_score=True,
+          return_estimator=True, n_jobs=-1):
+    """
+        More on cross validation: https://scikit-learn.org/stable/modules/cross_validation.html#
+        More on scoring: https://scikit-learn.org/stable/modules/model_evaluation.html#scoring-parameter
+    """
+    return cross_validate(clf, X, y, groups=groups, cv=cv, scoring=scoring, return_train_score=return_train_score,
+                          return_estimator=return_estimator, n_jobs=n_jobs)
+    
+
+
+# input_dim = df.drop(columns=['subject', 'label']).shape[1]
+# output_dim = 3
+# lstm_layers = 5
+# train_dl, _ = get_data_loader('S3', train_batch_size=25, val_batch_size=5)
+# model = WesadLSTM(input_dim, input_dim, output_dim, lstm_layers)
+# try_batch(model, train_dl)
+
+
+# def get_losso_cv(ds, y, **fit_params):
+#     print('X', type(ds.X))
+#     print('y', type(y))
+#     print('params', fit_params)
+#     X = ds.X
+#     for subject in fit_params['subjects']:
+#         print('LOSO', subject)
+#         train = X[X['subject'] != subject].reset_index(drop=True)#.copy()
+#         train_ds = skorch.dataset.Dataset(train.drop(columns=['subject','label']).copy(), train['label'].copy())
+#         val = X[X['subject'] == subject].reset_index(drop=True)#.copy()
+#         val_ds = skorch.dataset.Dataset(val.drop(columns=['subject','label']).copy(), val['label'].copy())
+
+#         yield train_ds, val_ds
+
+optimizer = torch.optim.Adam
+loso_cv = LeaveOneGroupOut()
+epochs = 5
+lr = 1e-4
+
+subjects = df['subject'].unique()
+subjects.sort()
+device = get_default_device()
+
+train_batch_size = 25
+val_batch_size = 5
+input_dim = df.drop(columns=['subject', 'label']).shape[1]
+output_dim = 3
+lstm_layers = 4
+dropout = 0.
+
+net = NeuralNetClassifier(module=WesadLSTM,
+                    module__input_dim=input_dim,
+                    module__hidden_dim=input_dim,
+                    module__output_dim=output_dim,
+                    module__lstm_layers=lstm_layers,
+                    module__dropout=dropout,
+                    # criterion=criterion, # using NLL_Loss so model need to apply softmax manually
+                    # train_split=CVSplit(cv=get_loso_cv(subjects=subjects, to_device=False)),
+                    # train_split=get_losso_cv,
+                    train_split=None,
+                    iterator_train__batch_size=train_batch_size,
+                    iterator_valid__batch_size=val_batch_size,
+                    max_epochs=epochs,
+                    lr=lr,
+                    device=device,
+                    optimizer=optimizer,
+                    callbacks=[
+                            #    ('progress_bar', skorch.callbacks.ProgressBar()),
+                               ('f1_macro', skorch.callbacks.EpochScoring(scoring='f1_macro', lower_is_better=False,
+                                                                         on_train=True)),
+                               ('accuracy', skorch.callbacks.EpochScoring(scoring='accuracy', lower_is_better=False,
+                                                                         on_train=True)),
+                               ('accuracy_val', skorch.callbacks.EpochScoring(scoring='accuracy', lower_is_better=False,
+                                                                         on_train=False)),
+                            #    ('checkpoint', skorch.callbacks.Checkpoint(dirname='lstm_model_rs')),
+                            #    ('lr_sched', skorch.callbacks.LRScheduler()),
+
+                    ]
+                    )
+
+normalizer = MinMaxScaler()
+X = normalizer.fit_transform(df.drop(columns=['subject','label']).copy().astype(np.float32))
+y = df['label'].copy()
+
+# net.fit(X, y, subjects=subjects)
+cv_net = run_cv(net, X, y, groups=df['subject'], cv=LeaveOneGroupOut(), n_jobs=1)
+
+
